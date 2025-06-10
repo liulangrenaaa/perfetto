@@ -40,19 +40,9 @@ HeapGraphBuilder::HeapGraphBuilder(std::unique_ptr<ByteIterator> iterator,
 HeapGraphBuilder::~HeapGraphBuilder() = default;
 
 bool HeapGraphBuilder::Parse() {
-  // Phase 1: Parse header
-  if (!ParseHeader()) {
-    context_->storage->IncrementStats(stats::hprof_header_errors);
-    return false;
-  }
-
-  // Phase 2: Parse records until end of file
   size_t record_count = 0;
-  while (!iterator_->IsEof()) {
+  while (ParseRecord()) {
     record_count++;
-    if (!ParseRecord()) {
-      break;
-    }
   }
 
   stats_.AddRecordCount(record_count);
@@ -60,10 +50,14 @@ bool HeapGraphBuilder::Parse() {
   return true;
 }
 
+void HeapGraphBuilder::PushBlob(TraceBlobView&& blob) {
+  iterator_->PushBlob(std::move(blob));
+}
+
 HeapGraph HeapGraphBuilder::BuildGraph() {
   // Phase 3: Resolve the heap graph
   resolver_ = std::make_unique<HeapGraphResolver>(context_, header_, objects_,
-                                                  classes_, stats_);
+                                                  classes_, roots_, stats_);
   resolver_->ResolveGraph();
 
   stats_.Write(context_);
@@ -113,6 +107,14 @@ bool HeapGraphBuilder::ParseHeader() {
 }
 
 bool HeapGraphBuilder::ParseRecord() {
+  // Shrinks the buffer to the current_offset we've parsed so far.
+  // It doesn't matter if we do it at the start or end of the method.
+  // We'll either shrink the n - 1 last records or n last records.
+  iterator_->Shrink();
+  if (!iterator_->CanReadRecord()) {
+    return false;
+  }
+
   uint8_t tag_value;
   if (!iterator_->ReadU1(tag_value)) {
     return false;
@@ -210,7 +212,7 @@ bool HeapGraphBuilder::ParseHeapDump(size_t length) {
   size_t end_position = iterator_->GetPosition() + length;
 
   // Parse heap dump records until we reach the end of the segment
-  while (iterator_->GetPosition() < end_position && !iterator_->IsEof()) {
+  while (iterator_->GetPosition() < end_position) {
     if (!ParseHeapDumpRecord()) {
       return false;
     }
@@ -313,7 +315,7 @@ bool HeapGraphBuilder::ParseRootRecord(HprofHeapRootTag tag) {
   }
 
   stats_.root_count++;
-  pending_roots_[object_id] = tag;
+  roots_[object_id] = tag;
   return true;
 }
 
@@ -382,12 +384,6 @@ bool HeapGraphBuilder::ParseClassStructure() {
   if (class_obj.GetId() == 0) {
     class_obj = Object(class_id, class_id, current_heap_, ObjectType::kClass);
     class_obj.SetHeapType(current_heap_);
-  }
-
-  auto pending_root = pending_roots_.Find(class_obj.GetId());
-  if (pending_root) {
-    class_obj.SetRootType(*pending_root);
-    pending_roots_.Erase(class_obj.GetId());
   }
 
   uint16_t static_field_count;
@@ -544,12 +540,6 @@ bool HeapGraphBuilder::ParseInstanceObject() {
     obj.SetRootType(root_type.value());
   }
 
-  auto pending = pending_roots_.Find(object_id);
-  if (pending) {
-    obj.SetRootType(*pending);
-    pending_roots_.Erase(object_id);
-  }
-
   objects_[object_id] = std::move(obj);
   stats_.instance_count++;
   return true;
@@ -592,12 +582,6 @@ bool HeapGraphBuilder::ParseObjectArrayObject() {
   obj.SetArrayElements(std::move(elements));
   obj.SetArrayElementType(FieldType::kObject);
   obj.SetHeapType(current_heap_);
-
-  auto pending = pending_roots_.Find(obj.GetId());
-  if (pending) {
-    obj.SetRootType(*pending);
-    pending_roots_.Erase(obj.GetId());
-  }
 
   objects_[array_id] = std::move(obj);
   stats_.object_array_count++;
@@ -653,12 +637,6 @@ bool HeapGraphBuilder::ParsePrimitiveArrayObject() {
   obj.SetRawData(std::move(data));
   obj.SetArrayElementType(element_type);
   obj.SetHeapType(current_heap_);
-
-  auto pending = pending_roots_.Find(obj.GetId());
-  if (pending) {
-    obj.SetRootType(*pending);
-    pending_roots_.Erase(obj.GetId());
-  }
 
   objects_[array_id] = std::move(obj);
   stats_.primitive_array_count++;
