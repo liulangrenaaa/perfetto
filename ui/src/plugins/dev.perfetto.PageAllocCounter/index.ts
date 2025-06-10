@@ -21,6 +21,7 @@ import {createQueryCounterTrack} from '../../components/tracks/query_counter_tra
 import {removeFalsyValues} from '../../base/array_utils';
 import {TrackNode} from '../../public/workspace';
 import ProcessThreadGroupsPlugin from '../dev.perfetto.ProcessThreadGroups';
+import {createQuerySliceTrack} from '../../components/tracks/query_slice_track';
 
 function uriForThreadStatePageAllocPages(upid: number | null, utid: number): string {
   return `${getThreadUriPrefix(upid, utid)}_state_pages`;
@@ -33,6 +34,11 @@ function uriForThreadStatePageAllocTimes(upid: number | null, utid: number): str
 function uriForThreadStatePageAllocTimeout(upid: number | null, utid: number): string {
   return `${getThreadUriPrefix(upid, utid)}_state_timeout`;
 }
+
+function uriForThreadStatePageFault(upid: number | null, utid: number): string {
+  return `${getThreadUriPrefix(upid, utid)}_pagefault`;
+}
+
 export default class implements PerfettoPlugin {
   static readonly id = 'dev.perfetto.PageAllocCounter';
   static readonly dependencies = [ProcessThreadGroupsPlugin];
@@ -65,6 +71,7 @@ export default class implements PerfettoPlugin {
       isMainThread: NUM_NULL,
       isKernelThread: NUM,
     });
+
     for (; it.valid(); it.next()) {
       const {utid, upid, tid, isMainThread, isKernelThread} = it;
       const title_pages = getTrackName({
@@ -88,9 +95,17 @@ export default class implements PerfettoPlugin {
         kind: THREAD_STATE_TRACK_KIND,
       });
 
+      const title_pagefault = getTrackName({
+        utid,
+        tid,
+        threadName: "pagefault",
+        kind: THREAD_STATE_TRACK_KIND,
+      });
+
       const uri_pages = uriForThreadStatePageAllocPages(upid, utid);
       const uri_times = uriForThreadStatePageAllocTimes(upid, utid);
       const uri_timeout = uriForThreadStatePageAllocTimeout(upid, utid);
+      const uri_pagefault = uriForThreadStatePageFault(upid, utid);
 
       const track_pages = await createQueryCounterTrack({
         trace: ctx,
@@ -258,6 +273,47 @@ export default class implements PerfettoPlugin {
         },
       });
 
+      const track_pagefault_slice = await createQuerySliceTrack({
+        trace: ctx,
+        uri: uri_pagefault,
+        data: {
+          sqlSource: `
+            WITH
+            original_data_pagefault AS (
+                SELECT 
+                  f.ts AS orig_ts, 
+                  CAST(SUBSTR(a.display_value, 21, 22) AS INTEGER) AS value,
+                  'PF' AS name
+                FROM ftrace_event f
+                JOIN args a USING(arg_set_id)
+                WHERE f.name = 'bpf_trace_printk' 
+                  AND a.display_value LIKE 'handle_mm_fault_end%' 
+                  AND f.utid = ${utid}
+            ),
+
+            original_data_pagefault_filemap AS (
+                SELECT 
+                  f.ts AS orig_ts, 
+                  CAST(SUBSTR(a.display_value, 21, 22) AS INTEGER) AS value,
+                  'filemap' AS name
+                FROM ftrace_event f
+                JOIN args a USING(arg_set_id)
+                WHERE f.name = 'bpf_trace_printk' 
+                  AND a.display_value LIKE 'filmap_do_fault_end%' 
+                  AND f.utid = ${utid}
+            )
+
+            SELECT orig_ts - value AS ts, value, name
+            FROM original_data_pagefault
+            UNION ALL
+            SELECT orig_ts - value AS ts, value, name
+            FROM original_data_pagefault_filemap
+            ORDER BY ts
+          `,
+          columns: ['ts', 'dur', 'name'],
+        },
+      });
+
       ctx.tracks.registerTrack({
         uri:uri_pages,
         title:title_pages,
@@ -303,15 +359,42 @@ export default class implements PerfettoPlugin {
         track: track_timeout,
       });
   
+      ctx.tracks.registerTrack({
+        uri: uri_pagefault,
+        title: title_pagefault,
+        tags: {
+          kind: THREAD_STATE_TRACK_KIND,
+          utid,
+          upid: upid ?? undefined,
+          ...(isKernelThread === 1 && {kernelThread: true}),
+        },
+        chips: removeFalsyValues([
+          isKernelThread === 0 && isMainThread === 1 && 'main thread',
+        ]),
+        track: track_pagefault_slice,
+      });
+
+
       const group = ctx.plugins
         .getPlugin(ProcessThreadGroupsPlugin)
         .getGroupForThread(utid);
+
+      // alloc_pages
       const tracknode_pages = new TrackNode({uri: uri_pages, title: title_pages, sortOrder: 10});
       group?.addChildInOrder(tracknode_pages);
+
+      // alloc_times
       const tracknode_times = new TrackNode({uri: uri_times, title: title_times, sortOrder: 10});
       group?.addChildInOrder(tracknode_times);
+
+      // alloc_timeout
       const tracknode_timeout = new TrackNode({uri: uri_timeout, title: title_timeout, sortOrder: 10});
       group?.addChildInOrder(tracknode_timeout);
+
+      // pagefault
+      const tracknode_pagefault = new TrackNode({uri: uri_pagefault, title: title_pagefault, sortOrder: 10});
+      group?.addChildInOrder(tracknode_pagefault);
+
     }
   }
 }
